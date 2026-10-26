@@ -1,0 +1,3 @@
+python-telegram-bot
+todus-sdk
+python-dotenv
