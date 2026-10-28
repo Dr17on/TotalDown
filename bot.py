@@ -1,5 +1,9 @@
 import os
 from dotenv import load_dotenv
+
+# ⬇️ ESTO ES LO QUE FALTABA: Cargar las variables ANTES de importar los handlers
+load_dotenv() 
+
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters
@@ -8,8 +12,6 @@ from database import init_db
 from handlers import (
     start, panel, key_command, panel_callback, handle_file
 )
-
-load_dotenv()
 
 def main():
     # Iniciar base de datos
