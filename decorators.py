@@ -1,39 +1,26 @@
+import os
 from functools import wraps
 from telegram import Update
 from telegram.ext import ContextTypes
-from database import is_authorized
-import os
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# Leemos la variable ADMIN_IDS y la convertimos en una lista de números
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(i.strip()) for i in ADMIN_IDS_STR.split(",") if i.strip().isdigit()]
 
-def require_auth(func):
+def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
-        if not is_authorized(user.id):
-            msg = (
-                "🔒 *Acceso restringido a TotalDown*\n\n"
-                "Envía tu key de acceso así:\n"
-                "`/key TD-XXXXXXXXXX`\n\n"
-                "Si no tienes una, pídesela al administrador."
-            )
+        
+        # Verificamos si el ID del usuario está en la lista permitida
+        if user.id not in ADMIN_IDS:
+            mensaje = "⛔ *Acceso denegado.*\nNo estás en la lista de usuarios autorizados para usar este bot."
+            
             if update.message:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await update.message.reply_text(mensaje, parse_mode="Markdown")
             elif update.callback_query:
-                await update.callback_query.answer("🔒 Necesitas autorización. Usa /key", show_alert=True)
+                await update.callback_query.answer("⛔ No tienes permiso para usar este bot.", show_alert=True)
             return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-def require_admin(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user = update.effective_user
-        if user.id != ADMIN_ID:
-            if update.message:
-                await update.message.reply_text("⛔ Solo el administrador puede usar esto.")
-            elif update.callback_query:
-                await update.callback_query.answer("⛔ Solo admin", show_alert=True)
-            return
+            
         return await func(update, context, *args, **kwargs)
     return wrapper
