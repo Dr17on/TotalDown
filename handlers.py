@@ -29,7 +29,6 @@ async def monitor_progress(chat_id: int, status_msg, custom_text=None):
                 pct = int((curr / tot) * 100) if tot > 0 else 0
                 pct = min(100, pct)
                 bar = "■" * (pct // 10) + "□" * (10 - (pct // 10))
-                
                 status_text = "⏳ Descargando de Telegram..." if state["status"] == "downloading" else "☁️ Subiendo a toDus..."
                 text = f"{status_text}\n\n{bar} {pct}%\n📦 {round(curr/(1024*1024),1)} MB / {round(tot/(1024*1024),1)} MB"
                 
@@ -107,7 +106,7 @@ async def clean_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🧹 Iniciando limpieza...")
     freed_space, deleted_files, files_deleted_list = 0, 0, []
     
-    search_paths = ["tmp_*", "*.temp", "temp_uploads/*", "*.part*"]
+    search_paths = ["tmp_*", "*.temp", "temp_uploads/*", "downloads/*", "*.part*"]
     for pattern in search_paths:
         for file_path in glob.glob(pattern):
             try:
@@ -136,24 +135,14 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
 
     if data == "cancel_upload":
-        if chat_id in UPLOAD_STATES:
-            UPLOAD_STATES[chat_id]["cancelled"] = True
+        if chat_id in UPLOAD_STATES: UPLOAD_STATES[chat_id]["cancelled"] = True
         await query.edit_message_text("🛑 *Cancelando...*", parse_mode="Markdown")
         return
 
     if data == "main":
         await query.edit_message_text("🎛️ *Panel de control*", parse_mode="Markdown", reply_markup=main_panel())
-    elif data == "info_upload":
-        await query.edit_message_text(
-            "📤 *Cómo subir un archivo*\n\n"
-            "Envíame un archivo. Si es mayor a 100MB, lo dividiré y te daré los enlaces.",
-            parse_mode="Markdown", reply_markup=back_button()
-        )
     elif data == "help":
-        await query.edit_message_text(
-            "❓ *Ayuda*\n\n• `/start` - Inicio\n• `/limpiar` - Borrar archivos temporales",
-            parse_mode="Markdown", reply_markup=back_button()
-        )
+        await query.edit_message_text("❓ *Ayuda*\n\n• `/start` - Inicio\n• `/limpiar` - Borrar archivos temporales", parse_mode="Markdown", reply_markup=back_button())
 
 # ---------- Manejo de Archivos ----------
 
@@ -192,33 +181,38 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_size = file_obj.file_size or 0
     file_size_mb = round(file_size / (1024 * 1024), 2)
     
-    # Verificación de espacio en disco ANTES de descargar
+    # CREAMOS LAS CARPETAS NECESARIAS
+    os.makedirs("downloads", exist_ok=True)
+    os.makedirs("temp_uploads", exist_ok=True)
+
+    # DIAGNÓSTICO DE DISCO
     try:
         total, used, free = shutil.disk_usage("/")
         free_mb = round(free / (1024 * 1024), 2)
+        print(f"💾 [DIAGNÓSTICO] Espacio libre: {free_mb} MB. Archivo a descargar: {file_size_mb} MB")
         
-        # Necesitamos espacio para el archivo original + un 10% extra (por si se divide)
-        needed_space = file_size * 1.1 
-        if free < needed_space:
+        if free < file_size:
             await msg.reply_text(
-                f"❌ *Espacio insuficiente en el servidor*\n\n"
+                f"❌ *Espacio insuficiente en el hosting*\n\n"
                 f"El archivo pesa: `{file_size_mb} MB`\n"
                 f"Espacio libre: `{free_mb} MB`\n\n"
-                f"Usa el comando `/limpiar` para borrar archivos temporales viejos y vuelve a intentarlo.",
+                f"Tu hosting actual no tiene espacio suficiente para descargar este archivo. Necesitas un hosting con más disco (mínimo 1.5 GB).",
                 parse_mode="Markdown"
             )
             return
-    except Exception:
-        pass # Si falla la lectura del disco, continuamos e intentamos descargar.
+    except Exception as e:
+        print(f"Error chequeando disco: {e}")
 
     UPLOAD_STATES[msg.chat_id] = {"current": 0, "total": file_size, "status": "downloading", "cancelled": False}
     status_msg = await msg.reply_text("⏳ *Iniciando descarga...*", parse_mode="Markdown", reply_markup=cancel_keyboard())
     monitor_task = asyncio.create_task(monitor_progress(msg.chat_id, status_msg))
     
-    local_path = f"tmp_{file_obj.file_unique_id}"
-    actual_path = None
+    # Guardamos la descarga en la carpeta 'downloads' para evitar problemas de permisos
     original_name = getattr(file_obj, 'file_name', f"{file_obj.file_unique_id}.mp4")
     safe_name = "".join(c for c in original_name if c.isalnum() or c in "._- ").strip()
+    local_path = os.path.join("downloads", f"tmp_{file_obj.file_unique_id}")
+    
+    actual_path = None
     
     try:
         actual_path = await download_with_pyrogram(file_obj.file_id, local_path, msg.chat_id)
@@ -226,27 +220,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if UPLOAD_STATES[msg.chat_id]["cancelled"]:
             raise Exception("Operación cancelada.")
 
-        os.makedirs("temp_uploads", exist_ok=True)
         upload_path = os.path.join("temp_uploads", safe_name)
         if os.path.exists(upload_path): os.remove(upload_path)
         os.rename(actual_path, upload_path)
         actual_path = upload_path
 
-        links_text = ""
-        
         # Si el archivo pesa más de 100MB, se divide
         if file_size > 100 * 1024 * 1024:
             await status_msg.edit_text(f"✂️ *Archivo grande ({file_size_mb} MB). Dividiendo en partes de 100MB...*", parse_mode="Markdown")
             parts = split_file(upload_path, 100)
-            os.remove(upload_path) # Borramos el original inmediatamente para liberar espacio
+            os.remove(upload_path) 
             
             links_text = f"✅ *¡Enlaces Generados!*\n\n📄 *Nombre:* `{safe_name}`\n🧩 *Partes:* {len(parts)}\n\n"
             links_text += "⚠️ *Para unir:* Descarga todas las partes y usa ZArchiver (Android) en la parte 1.\n\n"
             
             for i, part in enumerate(parts):
-                if UPLOAD_STATES[msg.chat_id]["cancelled"]:
-                    raise Exception("Operación cancelada durante la división.")
-                
                 part_size_mb = round(os.path.getsize(part) / (1024*1024), 1)
                 custom_msg = f"☁️ Subiendo parte {i+1} de {len(parts)} ({part_size_mb} MB)..."
                 
@@ -264,7 +252,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(links_text, parse_mode="Markdown", disable_web_page_preview=True)
 
         else:
-            # Subida normal para archivos pequeños
             UPLOAD_STATES[msg.chat_id]["status"] = "uploading"
             UPLOAD_STATES[msg.chat_id]["current"] = 0
             
@@ -278,7 +265,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_msg = str(e)
         if "cancelada" in error_msg.lower() or "cancelado" in error_msg.lower():
-            await status_msg.edit_text("🛑 *Operación cancelada por el usuario.*", parse_mode="Markdown")
+            await status_msg.edit_text("🛑 *Operación cancelada.*", parse_mode="Markdown")
         else:
             await status_msg.edit_text(f"❌ Error:\n`{error_msg}`", parse_mode="Markdown")
             
