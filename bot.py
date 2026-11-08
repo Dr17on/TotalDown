@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 
-# ⚠️ ESTO ES VITAL: Cargar las variables ANTES de importar los handlers y decoradores
 load_dotenv() 
 
 from telegram.ext import (
@@ -9,7 +8,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters
 )
 from handlers import (
-    start, panel, panel_callback, handle_file
+    start, panel, panel_callback, handle_file, clean_memory
 )
 
 def main():
@@ -18,23 +17,33 @@ def main():
         print("❌ ERROR: Falta TELEGRAM_BOT_TOKEN en las variables de entorno.")
         return
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
 
-    # Comandos protegidos
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
+    # REGISTRO DEL COMANDO LIMPIAR
+    app.add_handler(CommandHandler("limpiar", clean_memory))
     
-    # Botones protegidos
+    # Botones
     app.add_handler(CallbackQueryHandler(panel_callback))
     
-    # Archivos protegidos
+    # Archivos
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.VIDEO | filters.AUDIO |
         filters.PHOTO | filters.VOICE,
         handle_file
     ))
 
-    print("🤖 TotalDown Bot iniciado correctamente (Modo Lista Blanca)...")
+    print("🤖 TotalDown Bot iniciado correctamente...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
