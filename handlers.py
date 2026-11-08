@@ -76,7 +76,7 @@ def upload_to_todus_sync(file_path: str, phone: str, chat_id: int) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Bienvenido a *TotalDown*.\n\n"
-        "Envíame un archivo. Si supera los 100MB, lo dividiré automáticamente mientras lo descargo para no llenar el disco.",
+        "Envíame un archivo. Si supera los 100MB, te iré enviando los enlaces de cada parte a medida que se suban.",
         reply_markup=main_panel(), parse_mode="Markdown"
     )
 
@@ -130,7 +130,7 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- EL CORAZÓN DEL STREAMING (Descarga y subida por partes) ----------
 
 async def process_large_file_streaming(file_id: str, file_size: int, chat_id: int, status_msg, safe_name: str):
-    """Descarga en pedazos de 100MB usando stream_media y los sube a toDus sin llenar el disco"""
+    """Descarga en pedazos de 100MB y envía el enlace de cada parte inmediatamente"""
     api_id = int(os.getenv("API_ID", "0"))
     api_hash = os.getenv("API_HASH", "")
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -139,7 +139,6 @@ async def process_large_file_streaming(file_id: str, file_size: int, chat_id: in
     part_num = 1
     current_chunk_size = 0
     total_downloaded = 0
-    links_text = f"✅ *¡Enlaces Generados!*\n\n📄 *Nombre:* `{safe_name}`\n\n"
     
     os.makedirs("temp_uploads", exist_ok=True)
     part_file_path = os.path.join("temp_uploads", f"{safe_name}.part{part_num:03d}")
@@ -147,7 +146,6 @@ async def process_large_file_streaming(file_id: str, file_size: int, chat_id: in
 
     async with Client("totaldown_session", api_id=api_id, api_hash=api_hash, bot_token=bot_token) as app:
         try:
-            # Usamos stream_media para obtener el archivo en fragmentos pequeños (streaming)
             async for chunk in app.stream_media(file_id):
                 if UPLOAD_STATES.get(chat_id, {}).get("cancelled", False):
                     raise Exception("Operación cancelada.")
@@ -167,13 +165,19 @@ async def process_large_file_streaming(file_id: str, file_size: int, chat_id: in
                 if current_chunk_size >= chunk_size:
                     f_out.close()
                     
-                    # Cambiamos el estado a subiendo
                     custom_txt = f"☁️ Subiendo parte {part_num} a toDus..."
                     try: await status_msg.edit_text(custom_txt)
                     except: pass
 
                     part_url = await asyncio.to_thread(upload_to_todus_sync, part_file_path, os.getenv("TODUS_PHONE"), chat_id)
-                    links_text += f"🧩 *Parte {part_num}:* [Descargar]({part_url})\n`{part_url}`\n\n"
+                    
+                    # --- NUEVA LÓGICA: Enviar mensaje con el enlace de esta parte ---
+                    part_name = f"{safe_name}.part{part_num:03d}"
+                    await status_msg.reply_text(
+                        f"🧩 *Parte {part_num} lista:*\n📄 `{part_name}`\n🔗 [Descargar]({part_url})\n\n`{part_url}`",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
                     
                     # Borramos la parte subida para liberar espacio INMEDIATAMENTE
                     os.remove(part_file_path)
@@ -192,11 +196,22 @@ async def process_large_file_streaming(file_id: str, file_size: int, chat_id: in
                 except: pass
 
                 part_url = await asyncio.to_thread(upload_to_todus_sync, part_file_path, os.getenv("TODUS_PHONE"), chat_id)
-                links_text += f"🧩 *Parte {part_num}:* [Descargar]({part_url})\n`{part_url}`\n\n"
+                
+                # Enviar mensaje de la última parte
+                part_name = f"{safe_name}.part{part_num:03d}"
+                await status_msg.reply_text(
+                    f"🧩 *Parte {part_num} (Última) lista:*\n📄 `{part_name}`\n🔗 [Descargar]({part_url})\n\n`{part_url}`",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
                 os.remove(part_file_path)
 
-            links_text += "⚠️ *Para unir:* Descarga todas las partes y usa ZArchiver en la parte 1."
-            await status_msg.edit_text(links_text, parse_mode="Markdown", disable_web_page_preview=True)
+            # Mensaje final de confirmación
+            await status_msg.edit_text(
+                f"✅ *Proceso completado*\n\n📄 *Nombre:* `{safe_name}`\n🧩 *Partes enviadas:* {part_num}\n\n"
+                f"⚠️ _Descarga todas las partes y únelas usando ZArchiver en la parte 1._",
+                parse_mode="Markdown"
+            )
 
         except Exception as e:
             if f_out and not f_out.closed: f_out.close()
@@ -217,7 +232,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.makedirs("downloads", exist_ok=True)
     os.makedirs("temp_uploads", exist_ok=True)
 
-    # DIAGNÓSTICO DE DISCO (Solo necesitamos 150MB libres, no todo el tamaño del video)
     try:
         total, used, free = shutil.disk_usage("/")
         free_mb = round(free / (1024 * 1024), 2)
@@ -244,10 +258,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         if file_size > 100 * 1024 * 1024:
-            # Usamos la nueva función de streaming (no llena el disco)
             await process_large_file_streaming(file_obj.file_id, file_size, msg.chat_id, status_msg, safe_name)
         else:
-            # Para archivos pequeños (menos de 100MB), descarga normal
             async with Client("totaldown_session", api_id=int(os.getenv("API_ID")), api_hash=os.getenv("API_HASH"), bot_token=os.getenv("TELEGRAM_BOT_TOKEN")) as app:
                 local_path = os.path.join("downloads", f"tmp_{file_obj.file_unique_id}")
                 actual_path = await app.download_media(message=file_obj.file_id, file_name=local_path)
@@ -282,7 +294,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if msg.chat_id in UPLOAD_STATES: del UPLOAD_STATES[msg.chat_id]
         if actual_path and os.path.exists(actual_path): os.remove(actual_path)
-        # Limpieza de partes huérfanas
         for temp_file in glob.glob(f"temp_uploads/{safe_name}.part*"):
             try: os.remove(temp_file)
             except: pass
