@@ -59,22 +59,6 @@ class ProgressFileWrapper:
     def __getattr__(self, attr): return getattr(self.file, attr)
     def close(self): self.file.close()
 
-def split_file(file_path, chunk_size_mb=100):
-    chunk_size = chunk_size_mb * 1024 * 1024
-    parts = []
-    base_name = os.path.basename(file_path)
-    with open(file_path, 'rb') as f_in:
-        part_num = 1
-        while True:
-            chunk = f_in.read(chunk_size)
-            if not chunk: break
-            part_name = f"{base_name}.part{part_num:03d}"
-            with open(part_name, 'wb') as f_out:
-                f_out.write(chunk)
-            parts.append(part_name)
-            part_num += 1
-    return parts
-
 def upload_to_todus_sync(file_path: str, phone: str, chat_id: int) -> str:
     try:
         client = ToDusClient2(phone)
@@ -92,8 +76,7 @@ def upload_to_todus_sync(file_path: str, phone: str, chat_id: int) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Bienvenido a *TotalDown*.\n\n"
-        "Envíame un archivo. Si supera los 100MB, lo dividiré para que toDus no falle.\n\n"
-        "• `/limpiar` - Borrar archivos temporales",
+        "Envíame un archivo. Si supera los 100MB, lo dividiré automáticamente mientras lo descargo para no llenar el disco.",
         reply_markup=main_panel(), parse_mode="Markdown"
     )
 
@@ -144,33 +127,83 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "help":
         await query.edit_message_text("❓ *Ayuda*\n\n• `/start` - Inicio\n• `/limpiar` - Borrar archivos temporales", parse_mode="Markdown", reply_markup=back_button())
 
-# ---------- Manejo de Archivos ----------
+# ---------- EL CORAZÓN DEL STREAMING (Descarga y subida por partes) ----------
 
-async def download_progress(current, total, chat_id):
-    state = UPLOAD_STATES.get(chat_id)
-    if state:
-        if state.get("cancelled", False): raise Exception("Descarga cancelada.")
-        state["current"] = current
-        state["total"] = total
-
-async def download_with_pyrogram(file_id: str, local_path: str, chat_id: int) -> str:
+async def process_large_file_streaming(file_id: str, file_size: int, chat_id: int, status_msg, safe_name: str):
+    """Descarga en pedazos de 100MB y los sube a toDus sin llenar el disco"""
     api_id = int(os.getenv("API_ID", "0"))
     api_hash = os.getenv("API_HASH", "")
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
 
+    chunk_size = 100 * 1024 * 1024 # 100 MB
+    part_num = 1
+    current_chunk_size = 0
+    total_downloaded = 0
+    links_text = f"✅ *¡Enlaces Generados!*\n\n📄 *Nombre:* `{safe_name}`\n\n"
+    
+    os.makedirs("temp_uploads", exist_ok=True)
+    part_file_path = os.path.join("temp_uploads", f"{safe_name}.part{part_num:03d}")
+    f_out = open(part_file_path, "wb")
+
     async with Client("totaldown_session", api_id=api_id, api_hash=api_hash, bot_token=bot_token) as app:
         try:
-            downloaded_file_path = await app.download_media(
-                message=file_id, 
-                file_name=local_path,
-                progress=download_progress,
-                progress_args=(chat_id,)
-            )
-            if not downloaded_file_path:
-                raise Exception("El archivo descargado está vacío o no se pudo escribir en el disco.")
-            return downloaded_file_path
+            # Pyrogram nos permite iterar sobre el archivo en pequeños fragmentos en memoria
+            async for chunk in app.iter_download(file_id):
+                if UPLOAD_STATES.get(chat_id, {}).get("cancelled", False):
+                    raise Exception("Operación cancelada.")
+
+                f_out.write(chunk)
+                current_chunk_size += len(chunk)
+                total_downloaded += len(chunk)
+
+                # Actualizamos el progreso de descarga
+                pct = int((total_downloaded / file_size) * 100)
+                bar = "■" * (pct // 10) + "□" * (10 - (pct // 10))
+                custom_txt = f"⏳ Descargando y dividiendo...\n\n{bar} {pct}%\n📦 {round(total_downloaded/(1024*1024),1)} MB / {round(file_size/(1024*1024),1)} MB"
+                try: await status_msg.edit_text(custom_txt, reply_markup=cancel_keyboard())
+                except: pass
+
+                # Si el pedazo actual llegó a los 100MB, lo subimos
+                if current_chunk_size >= chunk_size:
+                    f_out.close()
+                    
+                    # Cambiamos el estado a subiendo
+                    custom_txt = f"☁️ Subiendo parte {part_num} a toDus..."
+                    try: await status_msg.edit_text(custom_txt)
+                    except: pass
+
+                    part_url = await asyncio.to_thread(upload_to_todus_sync, part_file_path, os.getenv("TODUS_PHONE"), chat_id)
+                    links_text += f"🧩 *Parte {part_num}:* [Descargar]({part_url})\n`{part_url}`\n\n"
+                    
+                    # Borramos la parte subida para liberar espacio INMEDIATAMENTE
+                    os.remove(part_file_path)
+                    
+                    # Preparamos el siguiente pedazo
+                    part_num += 1
+                    current_chunk_size = 0
+                    part_file_path = os.path.join("temp_uploads", f"{safe_name}.part{part_num:03d}")
+                    f_out = open(part_file_path, "wb")
+
+            # Al terminar la descarga, subimos el último pedazo si quedó algo
+            f_out.close()
+            if current_chunk_size > 0:
+                custom_txt = f"☁️ Subiendo última parte ({round(current_chunk_size/(1024*1024),1)} MB)..."
+                try: await status_msg.edit_text(custom_txt)
+                except: pass
+
+                part_url = await asyncio.to_thread(upload_to_todus_sync, part_file_path, os.getenv("TODUS_PHONE"), chat_id)
+                links_text += f"🧩 *Parte {part_num}:* [Descargar]({part_url})\n`{part_url}`\n\n"
+                os.remove(part_file_path)
+
+            links_text += "⚠️ *Para unir:* Descarga todas las partes y usa ZArchiver en la parte 1."
+            await status_msg.edit_text(links_text, parse_mode="Markdown", disable_web_page_preview=True)
+
         except Exception as e:
-            raise Exception(f"Fallo en Pyrogram: {str(e)}")
+            if f_out and not f_out.closed: f_out.close()
+            if os.path.exists(part_file_path): os.remove(part_file_path)
+            raise e
+
+# ---------- Manejo de Archivos ----------
 
 @admin_only
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,22 +214,20 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_size = file_obj.file_size or 0
     file_size_mb = round(file_size / (1024 * 1024), 2)
     
-    # CREAMOS LAS CARPETAS NECESARIAS
     os.makedirs("downloads", exist_ok=True)
     os.makedirs("temp_uploads", exist_ok=True)
 
-    # DIAGNÓSTICO DE DISCO
+    # DIAGNÓSTICO DE DISCO (Solo necesitamos 150MB libres, no todo el tamaño del video)
     try:
         total, used, free = shutil.disk_usage("/")
         free_mb = round(free / (1024 * 1024), 2)
-        print(f"💾 [DIAGNÓSTICO] Espacio libre: {free_mb} MB. Archivo a descargar: {file_size_mb} MB")
+        print(f"💾 [DIAGNÓSTICO] Espacio libre: {free_mb} MB. Archivo: {file_size_mb} MB")
         
-        if free < file_size:
+        if free < 150 * 1024 * 1024:
             await msg.reply_text(
-                f"❌ *Espacio insuficiente en el hosting*\n\n"
-                f"El archivo pesa: `{file_size_mb} MB`\n"
+                f"❌ *Espacio crítico en el hosting*\n\n"
                 f"Espacio libre: `{free_mb} MB`\n\n"
-                f"Tu hosting actual no tiene espacio suficiente para descargar este archivo. Necesitas un hosting con más disco (mínimo 1.5 GB).",
+                f"Usa `/limpiar` para liberar espacio. Necesitas al menos 150MB libres.",
                 parse_mode="Markdown"
             )
             return
@@ -204,58 +235,37 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error chequeando disco: {e}")
 
     UPLOAD_STATES[msg.chat_id] = {"current": 0, "total": file_size, "status": "downloading", "cancelled": False}
-    status_msg = await msg.reply_text("⏳ *Iniciando descarga...*", parse_mode="Markdown", reply_markup=cancel_keyboard())
-    monitor_task = asyncio.create_task(monitor_progress(msg.chat_id, status_msg))
+    status_msg = await msg.reply_text("⏳ *Iniciando proceso...*", parse_mode="Markdown", reply_markup=cancel_keyboard())
     
-    # Guardamos la descarga en la carpeta 'downloads' para evitar problemas de permisos
     original_name = getattr(file_obj, 'file_name', f"{file_obj.file_unique_id}.mp4")
     safe_name = "".join(c for c in original_name if c.isalnum() or c in "._- ").strip()
-    local_path = os.path.join("downloads", f"tmp_{file_obj.file_unique_id}")
     
     actual_path = None
     
     try:
-        actual_path = await download_with_pyrogram(file_obj.file_id, local_path, msg.chat_id)
-        
-        if UPLOAD_STATES[msg.chat_id]["cancelled"]:
-            raise Exception("Operación cancelada.")
-
-        upload_path = os.path.join("temp_uploads", safe_name)
-        if os.path.exists(upload_path): os.remove(upload_path)
-        os.rename(actual_path, upload_path)
-        actual_path = upload_path
-
-        # Si el archivo pesa más de 100MB, se divide
         if file_size > 100 * 1024 * 1024:
-            await status_msg.edit_text(f"✂️ *Archivo grande ({file_size_mb} MB). Dividiendo en partes de 100MB...*", parse_mode="Markdown")
-            parts = split_file(upload_path, 100)
-            os.remove(upload_path) 
-            
-            links_text = f"✅ *¡Enlaces Generados!*\n\n📄 *Nombre:* `{safe_name}`\n🧩 *Partes:* {len(parts)}\n\n"
-            links_text += "⚠️ *Para unir:* Descarga todas las partes y usa ZArchiver (Android) en la parte 1.\n\n"
-            
-            for i, part in enumerate(parts):
-                part_size_mb = round(os.path.getsize(part) / (1024*1024), 1)
-                custom_msg = f"☁️ Subiendo parte {i+1} de {len(parts)} ({part_size_mb} MB)..."
-                
-                monitor_task.cancel()
-                monitor_task = asyncio.create_task(monitor_progress(msg.chat_id, status_msg, custom_text=custom_msg))
-                
-                UPLOAD_STATES[msg.chat_id]["current"] = 0
-                UPLOAD_STATES[msg.chat_id]["total"] = os.path.getsize(part)
-                UPLOAD_STATES[msg.chat_id]["status"] = "uploading"
-                
-                part_url = await asyncio.to_thread(upload_to_todus_sync, part, os.getenv("TODUS_PHONE"), msg.chat_id)
-                links_text += f"🧩 *Parte {i+1}:* [Descargar]({part_url})\n`{part_url}`\n\n"
-                os.remove(part)
-
-            await status_msg.edit_text(links_text, parse_mode="Markdown", disable_web_page_preview=True)
-
+            # Usamos la nueva función de streaming (no llena el disco)
+            await process_large_file_streaming(file_obj.file_id, file_size, msg.chat_id, status_msg, safe_name)
         else:
+            # Para archivos pequeños (menos de 100MB), descarga normal
+            async with Client("totaldown_session", api_id=int(os.getenv("API_ID")), api_hash=os.getenv("API_HASH"), bot_token=os.getenv("TELEGRAM_BOT_TOKEN")) as app:
+                local_path = os.path.join("downloads", f"tmp_{file_obj.file_unique_id}")
+                actual_path = await app.download_media(message=file_obj.file_id, file_name=local_path)
+            
+            if UPLOAD_STATES[msg.chat_id]["cancelled"]:
+                raise Exception("Operación cancelada.")
+
+            upload_path = os.path.join("temp_uploads", safe_name)
+            if os.path.exists(upload_path): os.remove(upload_path)
+            os.rename(actual_path, upload_path)
+            actual_path = upload_path
+
             UPLOAD_STATES[msg.chat_id]["status"] = "uploading"
             UPLOAD_STATES[msg.chat_id]["current"] = 0
+            UPLOAD_STATES[msg.chat_id]["total"] = file_size
             
             s3_url = await asyncio.to_thread(upload_to_todus_sync, upload_path, os.getenv("TODUS_PHONE"), msg.chat_id)
+            
             await status_msg.edit_text(
                 f"✅ *¡Enlace Generado!*\n\n📄 *Nombre:* `{safe_name}`\n🔗 [Haz clic aquí para descargar]({s3_url})\n\n`{s3_url}`", 
                 parse_mode="Markdown", disable_web_page_preview=True
@@ -271,9 +281,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     finally:
         if msg.chat_id in UPLOAD_STATES: del UPLOAD_STATES[msg.chat_id]
-        monitor_task.cancel()
         if actual_path and os.path.exists(actual_path): os.remove(actual_path)
-        if local_path and os.path.exists(local_path): os.remove(local_path)
+        # Limpieza de partes huérfanas
         for temp_file in glob.glob(f"temp_uploads/{safe_name}.part*"):
             try: os.remove(temp_file)
             except: pass
