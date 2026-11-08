@@ -130,7 +130,7 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- EL CORAZÓN DEL STREAMING (Descarga y subida por partes) ----------
 
 async def process_large_file_streaming(file_id: str, file_size: int, chat_id: int, status_msg, safe_name: str):
-    """Descarga en pedazos de 100MB y los sube a toDus sin llenar el disco"""
+    """Descarga en pedazos de 100MB usando stream_media y los sube a toDus sin llenar el disco"""
     api_id = int(os.getenv("API_ID", "0"))
     api_hash = os.getenv("API_HASH", "")
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -147,8 +147,8 @@ async def process_large_file_streaming(file_id: str, file_size: int, chat_id: in
 
     async with Client("totaldown_session", api_id=api_id, api_hash=api_hash, bot_token=bot_token) as app:
         try:
-            # Pyrogram nos permite iterar sobre el archivo en pequeños fragmentos en memoria
-            async for chunk in app.iter_download(file_id):
+            # Usamos stream_media para obtener el archivo en fragmentos pequeños (streaming)
+            async for chunk in app.stream_media(file_id):
                 if UPLOAD_STATES.get(chat_id, {}).get("cancelled", False):
                     raise Exception("Operación cancelada.")
 
